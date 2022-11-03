@@ -57,6 +57,7 @@ async fn main() -> anyhow::Result<()> {
         ..Default::default()
     };
     let workload_manager = workload::WorkloadManager::new(config.clone());
+    let cert_manager = identity::SecretManager::new(config.clone());
 
     let workloads = workload_manager.workloads();
     admin::Builder::new("[::]:15022".parse().unwrap(), workloads)
@@ -65,8 +66,7 @@ async fn main() -> anyhow::Result<()> {
         .expect("admin server starts")
         .spawn();
     let workloads = workload_manager.workloads();
-    let secrets = identity::SecretManager::new(config.clone());
-    let proxy = proxy::Proxy::new(config.clone(), workloads, secrets).await?;
+    let proxy = proxy::Proxy::new(config.clone(), workloads, cert_manager.clone()).await?;
     tasks.push(tokio::spawn(async move {
         if let Err(e) = workload_manager.run().await {
             error!("workload manager: {}", e);

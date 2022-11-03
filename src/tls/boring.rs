@@ -15,6 +15,7 @@ use boring::ssl;
 use boring::stack::Stack;
 use boring::x509;
 use boring::x509::extension::SubjectAlternativeName;
+use boring::asn1::{Asn1Time, Asn1TimeRef};
 use hyper::client::ResponseFuture;
 use hyper::{Request, Uri};
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -69,11 +70,37 @@ impl CsrOptions {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Certs {
     // TODO: pretty sure this needs the full chain at some point
     cert: x509::X509,
     key: pkey::PKey<pkey::Private>,
+}
+
+impl<'a> Certs {
+    pub fn not_before(&'a self) -> &'a Asn1TimeRef {
+        self.cert.not_before()
+    }
+    pub fn not_after(&'a self) -> &'a Asn1TimeRef {
+        self.cert.not_after()
+    }
+
+    pub fn get_seconds_until_refresh(&self) -> u64 {
+        let current = Asn1Time::days_from_now(0).unwrap();
+        let start: &Asn1TimeRef = self.not_before();
+        let end: &Asn1TimeRef = self.not_after();
+
+        let total_lifetime = start.diff(end).unwrap();
+        let total_lifetime_secs = total_lifetime.days * 86400 + total_lifetime.secs;
+        let halflife = total_lifetime_secs/2;
+        let elapsed = start.diff(&current).unwrap();
+        let elapsed_secs = elapsed.days * 86400 + elapsed.secs; // 86400 secs/day
+        let returnval : i32 = halflife-elapsed_secs;
+        if returnval < 0 {
+            return 0 as u64
+        }
+        returnval as u64
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -197,7 +224,7 @@ impl Alpn {
 
 #[async_trait::async_trait]
 pub trait CertProvider: Send + Sync + Clone {
-    async fn fetch_cert(&self, fd: RawFd) -> Result<ssl::SslAcceptor, TlsError>;
+    async fn fetch_cert(&mut self, fd: RawFd) -> Result<ssl::SslAcceptor, TlsError>;
 }
 
 #[derive(Clone)]
@@ -232,7 +259,7 @@ where
 
     fn accept(&self, conn: C) -> Self::AcceptFuture {
         let fd = conn.as_raw_fd();
-        let acceptor = self.acceptor.clone();
+        let mut acceptor = self.acceptor.clone();
         Box::pin(async move {
             let tls = acceptor.fetch_cert(fd).await?;
             tokio_boring::accept(&tls, conn)

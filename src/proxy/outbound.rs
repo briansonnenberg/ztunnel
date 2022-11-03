@@ -1,3 +1,4 @@
+use std::time::{Instant};
 use boring::ssl::ConnectConfiguration;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
@@ -47,20 +48,24 @@ impl Outbound {
         loop {
             // Asynchronously wait for an inbound socket.
             let socket = self.listener.accept().await;
+            let start_outbound_instant = Instant::now();
             match socket {
                 Ok((stream, remote)) => {
                     info!("accepted outbound connection from {}", remote);
                     let cfg = self.cfg.clone();
-                    let oc = OutboundConnection {
+                    let mut oc = OutboundConnection {
                         cert_manager: self.cert_manager.clone(),
                         workloads: self.workloads.clone(),
                         cfg,
                     };
                     tokio::spawn(async move {
+
                         let res = oc.proxy(stream).await;
                         match res {
-                            Ok(_) => info!("outbound proxy complete"),
-                            Err(ref e) => warn!("outbound proxy failed: {}", e),
+                            Ok(_) => info!("outbound proxy complete ({}ms)",
+                                                    start_outbound_instant.elapsed().as_millis()),
+                            Err(ref e) => warn!("outbound proxy failed: {} ({}ms)", e,
+                                                    start_outbound_instant.elapsed().as_millis()),
                         };
                     });
                 }
@@ -78,7 +83,7 @@ struct OutboundConnection {
 }
 
 impl OutboundConnection {
-    async fn proxy(&self, mut stream: TcpStream) -> Result<(), Error> {
+    async fn proxy(&mut self, mut stream: TcpStream) -> Result<(), Error> {
         let remote_addr =
             super::to_canonical_ip(stream.peer_addr().expect("must receive peer addr"));
         let orig = socket::orig_dst_addr(&stream).expect("must have original dst enabled");
@@ -109,7 +114,7 @@ impl OutboundConnection {
                     .unwrap();
 
                 let mut request_sender = if self.cfg.tls {
-                    let id = req.source.identity();
+                    let id = &req.source.identity();
                     let cert = self.cert_manager.fetch_certificate(id).await?;
                     let connector = cert.connector()?.configure()?;
                     let tcp_stream = TcpStream::connect(req.gateway).await?;
