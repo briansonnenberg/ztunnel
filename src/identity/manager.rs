@@ -1,8 +1,9 @@
 use std::fmt;
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::collections::{HashSet, HashMap};
+use std::sync::{Arc, RwLock};
 use tokio::time::{sleep, Duration};
 use tracing::instrument;
+use tokio::sync;
 
 use super::CaClient;
 use super::Error;
@@ -36,37 +37,43 @@ impl fmt::Display for Identity {
 #[derive(Clone)]
 pub struct SecretManager {
     client: CaClient,
-    cache: Arc<Mutex<HashMap<Identity, tls::Certs>>>,
+    outstanding_ca_requests: Arc<sync::RwLock<HashSet<Identity>>>,
+    cache: Arc<RwLock<HashMap<Identity, tls::Certs>>>,
 }
 
 impl SecretManager {
     pub fn new(cfg: crate::config::Config) -> SecretManager {
-        let client = CaClient::new(cfg.auth);
+        let caclient = CaClient::new(cfg.auth);
+        let outstanding_ca_requests: HashSet<Identity> = Default::default();
         let cache: HashMap<Identity, tls::Certs> = Default::default();
-        return SecretManager { client: client, cache: Arc::new(Mutex::new(cache)) };
+        SecretManager {
+            client: caclient,
+            outstanding_ca_requests: Arc::new(sync::RwLock::new(outstanding_ca_requests)),
+            cache: Arc::new(RwLock::new(cache))
+        }
     }
 
-    pub async fn refresh_handler(id: Identity, ctx: SecretManager, initial_sleep_time: u64) {
+    pub async fn refresh_handler(id: Identity, ctx: SecretManager, initial_sleep_time: Duration) {
         info!("refreshing certs for id {} in {:?} seconds", id, initial_sleep_time);
-        sleep(Duration::from_secs(initial_sleep_time)).await;
+        sleep(initial_sleep_time).await;
         loop {
             match ctx.client.clone().fetch_certificate(id.clone()).await {
                 Err(e) => {
                     // Cert refresh has failed. Drop cert from the cache.
                     warn!("Failed cert refresh for id {:?}: {:?}", id, e);
-                    { // lock cache
-                        let mut locked_cache = ctx.cache.lock().unwrap();
+                    {
+                        let mut locked_cache = ctx.cache.write().unwrap();
                         locked_cache.remove(&id.clone());
-                    } // unlock cache
+                    }
                     return;
                 }
                 Ok(fetched_certs) => {
                     info!("refreshed certs {:?}", fetched_certs);
-                    { // lock cache
-                        let mut locked_cache = ctx.cache.lock().unwrap();
+                    {
+                        let mut locked_cache = ctx.cache.write().unwrap();
                         locked_cache.insert(id.clone(), fetched_certs.clone());
-                    } // unlock cache
-                    let sleep_dur = Duration::from_secs(fetched_certs.get_seconds_until_refresh());
+                    }
+                    let sleep_dur = fetched_certs.get_duration_until_refresh();
                     info!("refreshing certs for id {} in {:?} seconds", id, sleep_dur);
                     sleep(sleep_dur).await;
                 }
@@ -77,27 +84,63 @@ impl SecretManager {
     #[instrument(skip_all, fields(%id))]
     pub async fn fetch_certificate(&mut self, id: &Identity) -> Result<tls::Certs, Error> {
         // Check cache first
-        { // lock cache
-            let locked_cache = self.cache.lock().unwrap();
+        {
+            let locked_cache = self.cache.read().unwrap();
             let cache_certs: std::option::Option<&tls::Certs> = locked_cache.get(id);
-            info!("cache certs for req: {:?}", cache_certs);
+            info!("initial cache certs for req: {:?}", cache_certs);
             if cache_certs.is_some() {
                 return Ok(cache_certs.unwrap().clone())
             }
-        } // unlock cache
+        }
 
+        loop {
+            let mut write_locked_reqs = self.outstanding_ca_requests.write().await;
+
+            if !write_locked_reqs.contains(id) {
+                // No other thread has reached this point and indicated they are requesting.  Indicate that we will.
+                write_locked_reqs.insert(id.clone());
+                break;
+            } else {
+                // Another thread started the request before we took the exclusive lock.  Wait for it to finish.
+                drop(write_locked_reqs);
+                loop {
+                    let read_locked_reqs = self.outstanding_ca_requests.read().await;
+                    if !read_locked_reqs.contains(id) {
+                        break;
+                    }
+                }
+                
+                // Now check the cache again.  Should have an entry unless the ca request failed,
+                // in which case, we try to take the exclusive lock to fetch again.  TODO: Don't spam CA server
+                {
+                    let locked_cache = self.cache.read().unwrap();
+                    let cache_certs: std::option::Option<&tls::Certs> = locked_cache.get(id);
+                    info!("cache certs for req: {:?}", cache_certs);
+                    if cache_certs.is_some() {
+                        return Ok(cache_certs.unwrap().clone())
+                    }
+                }
+            }
+        }
+        
         // No cache entry, fetch it and spawn refresh handler
         let fetched_certs = self.client.clone().fetch_certificate(id.clone()).await?;
         info!("fetched certs {:?}", fetched_certs);
-        { // lock cache
-            let mut locked_cache = self.cache.lock().unwrap();
+        {
+            let mut locked_cache = self.cache.write().unwrap();
             locked_cache.insert(id.clone(), fetched_certs.clone());
-        } // unlock cache
+        }
 
-        tokio::spawn(SecretManager::refresh_handler(id.clone(),
-                                                        self.clone(),
-                                                        fetched_certs.get_seconds_until_refresh()));
+        tokio::spawn(SecretManager::refresh_handler(
+            id.clone(),
+            self.clone(),
+            fetched_certs.get_duration_until_refresh()));
 
-        Ok(fetched_certs.clone())
+        {
+            let mut write_locked_reqs = self.outstanding_ca_requests.write().await;
+            write_locked_reqs.remove(id);
+        }        
+        Ok(fetched_certs)
+        
     }
 }
