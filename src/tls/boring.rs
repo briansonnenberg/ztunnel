@@ -161,8 +161,8 @@ impl Certs {
 
         // Ensure that client certificates are validated when present.
         conn.set_verify(ssl::SslVerifyMode::FAIL_IF_NO_PEER_CERT);
-        conn.set_verify_callback(ssl::SslVerifyMode::PEER, |_, _| {
-            // TODO: this MUST verify before upstreaming
+        conn.set_verify_callback(ssl::SslVerifyMode::PEER, |verified, x509_ctx| {
+            info!("internal verification: {} ----- Error: {:?}", verified, x509_ctx.error());
             true
         });
         conn.set_alpn_protos(Alpn::H2.encode())?;
@@ -177,8 +177,8 @@ impl Certs {
         conn.check_private_key()?;
 
         conn.set_verify(ssl::SslVerifyMode::FAIL_IF_NO_PEER_CERT);
-        conn.set_verify_callback(ssl::SslVerifyMode::PEER, |_, _| {
-            // TODO: this MUST verify before upstreaming
+        conn.set_verify_callback(ssl::SslVerifyMode::PEER, |verified, x509_ctx| {
+            info!("internal verification: {} ----- Error: {:?}", verified, x509_ctx.error());
             true
         });
 

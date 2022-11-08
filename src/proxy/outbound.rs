@@ -115,7 +115,7 @@ impl OutboundConnection {
 
                 let mut request_sender = if self.cfg.tls {
                     let id = &req.source.identity();
-                    let cert = self.cert_manager.fetch_certificate(id).await?;
+                    let cert = self.cert_manager.clone().fetch_certificate(id).await?;
                     let connector = cert.connector()?.configure()?;
                     let tcp_stream = TcpStream::connect(req.gateway).await?;
                     let tls_stream = connect_tls(connector, tcp_stream).await?;

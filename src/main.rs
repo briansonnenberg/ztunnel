@@ -66,7 +66,7 @@ async fn main() -> anyhow::Result<()> {
         .expect("admin server starts")
         .spawn();
     let workloads = workload_manager.workloads();
-    let proxy = proxy::Proxy::new(config.clone(), workloads, cert_manager.clone()).await?;
+    let proxy = proxy::Proxy::new(config.clone(), workloads, cert_manager).await?;
     tasks.push(tokio::spawn(async move {
         if let Err(e) = workload_manager.run().await {
             error!("workload manager: {}", e);

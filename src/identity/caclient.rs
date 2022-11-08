@@ -1,13 +1,15 @@
 use std::collections::BTreeMap;
+use tokio::time::timeout;
+use::std::time::Duration;
 
 use prost_types::value::Kind;
 use prost_types::Struct;
 use tonic::codegen::InterceptedService;
-use tracing::instrument;
+use tracing::{info, instrument};
 
 use crate::identity::auth::AuthSource;
 use crate::identity::manager::Identity;
-use crate::identity::Error;
+use crate::identity::{Error, self};
 use crate::tls;
 use crate::tls::TlsGrpcChannel;
 use crate::xds::istio::ca::istio_certificate_service_client::IstioCertificateServiceClient;
@@ -52,8 +54,18 @@ impl CaClient {
                 )]),
             }),
         };
-        let resp = self.client.create_certificate(req).await?;
-        let resp = resp.into_inner();
+        info!("Sending ca request for id {:?}\nreq: {:?}", id, req);
+        let resp_res = self.client.create_certificate(req).await;
+        info!("response: {:?}", resp_res);
+        let resp;
+        match resp_res {
+            Err(e) => {
+                return Err(identity::Error::SigningRequest(e));
+            }
+            Ok(v) => {
+                resp = v.into_inner();
+            }
+        }
         Ok(tls::cert_from(
             &pkey,
             resp.cert_chain.first().unwrap().as_bytes(),

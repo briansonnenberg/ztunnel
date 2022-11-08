@@ -87,21 +87,20 @@ impl SecretManager {
         {
             let locked_cache = self.cache.read().unwrap();
             let cache_certs: std::option::Option<&tls::Certs> = locked_cache.get(id);
-            info!("initial cache certs for req: {:?}", cache_certs);
             if cache_certs.is_some() {
                 return Ok(cache_certs.unwrap().clone())
             }
         }
 
         loop {
+            // Bottleneck here waiting for the write lock for the list of outstanding ca requests.
             let mut write_locked_reqs = self.outstanding_ca_requests.write().await;
-
             if !write_locked_reqs.contains(id) {
                 // No other thread has reached this point and indicated they are requesting.  Indicate that we will.
                 write_locked_reqs.insert(id.clone());
                 break;
             } else {
-                // Another thread started the request before we took the exclusive lock.  Wait for it to finish.
+                // Another thread started the request before we took the write lock.  Wait for it to finish.
                 drop(write_locked_reqs);
                 loop {
                     let read_locked_reqs = self.outstanding_ca_requests.read().await;
@@ -109,9 +108,8 @@ impl SecretManager {
                         break;
                     }
                 }
-                
-                // Now check the cache again.  Should have an entry unless the ca request failed,
-                // in which case, we try to take the exclusive lock to fetch again.  TODO: Don't spam CA server
+                info!("Done waiting, checking cache.");
+                // Now check the cache again.  Should have an entry unless the ca request failed
                 {
                     let locked_cache = self.cache.read().unwrap();
                     let cache_certs: std::option::Option<&tls::Certs> = locked_cache.get(id);
@@ -120,27 +118,37 @@ impl SecretManager {
                         return Ok(cache_certs.unwrap().clone())
                     }
                 }
+                // other CA request must have failed, try again
+
+        }
+
+        info!("No cache entry, doing fetch...");
+        // No cache entry, fetch it and spawn refresh handler
+        let fetched_certs_res = self.client.clone().fetch_certificate(id.clone()).await;
+        match fetched_certs_res {
+            Err(e) => {
+                let mut write_locked_reqs = self.outstanding_ca_requests.write().await;
+                write_locked_reqs.remove(id);
+                return Err(e);
+            },
+            Ok(fetched_certs) => {
+                info!("fetched certs {:?}", fetched_certs);
+                {
+                    let mut locked_cache = self.cache.write().unwrap();
+                    /* locked_cache.insert(id.clone(), fetched_certs.clone()); */
+                }
+              /*   tokio::spawn(SecretManager::refresh_handler(
+                    id.clone(),
+                    self.clone(),
+                    fetched_certs.get_duration_until_refresh())); */
+                {
+                    let mut write_locked_reqs = self.outstanding_ca_requests.write().await;
+                    warn!("pre: {:?}", write_locked_reqs);
+                    write_locked_reqs.remove(id);
+                    warn!("post: {:?}", write_locked_reqs);
+                }
+                Ok(fetched_certs)
             }
         }
-        
-        // No cache entry, fetch it and spawn refresh handler
-        let fetched_certs = self.client.clone().fetch_certificate(id.clone()).await?;
-        info!("fetched certs {:?}", fetched_certs);
-        {
-            let mut locked_cache = self.cache.write().unwrap();
-            locked_cache.insert(id.clone(), fetched_certs.clone());
-        }
-
-        tokio::spawn(SecretManager::refresh_handler(
-            id.clone(),
-            self.clone(),
-            fetched_certs.get_duration_until_refresh()));
-
-        {
-            let mut write_locked_reqs = self.outstanding_ca_requests.write().await;
-            write_locked_reqs.remove(id);
-        }        
-        Ok(fetched_certs)
-        
     }
 }
